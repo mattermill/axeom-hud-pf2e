@@ -433,13 +433,16 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
     });
     const tokenScreenWidth = bottomRight.x - topLeft.x;
     const tokenScreenHeight = bottomRight.y - topLeft.y;
-    let left = topLeft.x + tokenScreenWidth + 15;
-    let top = topLeft.y + tokenScreenHeight / 2;
     const padding = 20;
-    const hudWidth = 240;
-    const hudHeight = 200;
+    const hudWidth = this.element.offsetWidth || 240;
+    const hudHeight = this.element.offsetHeight || 200;
+    let left = topLeft.x + tokenScreenWidth + 15;
     if (left + hudWidth > window.innerWidth - padding)
       left = topLeft.x - hudWidth - 15;
+    const anchorY = topLeft.y + tokenScreenHeight / 2;
+    let top = anchorY;
+    if (top + hudHeight > window.innerHeight - padding)
+      top = anchorY - hudHeight;
     const finalLeft = Math.max(
       padding,
       Math.min(left, window.innerWidth - hudWidth - padding),
@@ -783,9 +786,10 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
   }
 
   _showSubmenu(trigger, submenu, skipReset = false) {
-    this._positionSubmenu(trigger, submenu);
     trigger.classList.add("ax-th-expanded");
+    // Must be visible before measuring; a display:none submenu reports zero size.
     submenu.classList.add("ax-th-active");
+    this._positionSubmenu(trigger, submenu);
     if (submenu.classList.contains("ax-th-status-effects")) {
       const search = submenu.querySelector("[data-effect-search='true']");
       if (search) {
@@ -830,13 +834,22 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
   }
 
   _positionSubmenu(trigger, submenu) {
-    const triggerRect = trigger.getBoundingClientRect();
-    const submenuRect = submenu.getBoundingClientRect();
+    if (!trigger) return;
+    const padding = 20;
     submenu.classList.remove("ax-th-flip-horizontal", "ax-th-flip-vertical");
-    if (triggerRect.right + submenuRect.width > window.innerWidth - 20)
+    submenu.style.maxHeight = "";
+    const triggerRect = trigger.getBoundingClientRect();
+    const { width, height } = submenu.getBoundingClientRect();
+    if (triggerRect.right + width > window.innerWidth - padding)
       submenu.classList.add("ax-th-flip-horizontal");
-    if (triggerRect.top + submenuRect.height > window.innerHeight - 20)
+    const spaceBelow = window.innerHeight - padding - triggerRect.top;
+    const spaceAbove = triggerRect.bottom - padding;
+    if (height <= spaceBelow) return;
+    if (height <= spaceAbove || spaceAbove > spaceBelow)
       submenu.classList.add("ax-th-flip-vertical");
+    const available = Math.max(spaceAbove, spaceBelow);
+    if (height > available)
+      submenu.style.maxHeight = `${Math.max(available, 100)}px`;
   }
 
   async _onTogglePalette(event, target) {
