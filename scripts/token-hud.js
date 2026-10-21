@@ -34,9 +34,46 @@ Hooks.once("init", function () {
       return originalTestVisibility.call(this, visionSource, mode, config);
     };
   }
+
+  const TokenLayer = foundry.canvas.layers.TokenLayer;
+  if (typeof libWrapper !== "undefined") {
+    libWrapper.register(
+      "axeom-hud-pf2e",
+      "foundry.canvas.layers.TokenLayer.prototype._onClickRight",
+      function (wrapped, event) {
+        return deferHudClose(this.hud, () => wrapped(event));
+      },
+      "WRAPPER",
+    );
+  } else {
+    const originalOnClickRight = TokenLayer.prototype._onClickRight;
+    TokenLayer.prototype._onClickRight = function (event) {
+      return deferHudClose(this.hud, () =>
+        originalOnClickRight.call(this, event),
+      );
+    };
+  }
 });
 
-Hooks.on("refreshToken", (token) => {
+// Foundry closes the HUD on right-button press, before it knows whether the
+// press starts a drag-pan. Defer that close until release so panning keeps it.
+function deferHudClose(hud, handler) {
+  if (!(hud instanceof AxTokenHud) || !hud.rendered) return handler();
+  hud._deferClose = true;
+  try {
+    return handler();
+  } finally {
+    hud._deferClose = false;
+  }
+}
+
+Hooks.on("canvasPan", () => {
+  canvas.tokens?.hud?.followToken?.();
+});
+
+Hooks.on("refreshToken", (token, flags) => {
+  if (flags.refreshPosition && token.hasActiveHUD)
+    token.layer.hud.followToken?.();
   if (!game.user.isGM) return;
   const flag =
     token.document.getFlag("axeom-hud-pf2e", "conditional-visibility-actors") ??
@@ -105,7 +142,29 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
     return this.document?.actor;
   }
   bind(object) {
+    this._attachment = null;
     return super.bind(object);
+  }
+
+  _closeOnReleaseUnlessPanned() {
+    let panned = false;
+    const hookId = Hooks.on("canvasPan", () => (panned = true));
+    window.addEventListener(
+      "pointerup",
+      () => {
+        Hooks.off("canvasPan", hookId);
+        if (!panned && this.rendered) this.close();
+      },
+      { once: true, capture: true },
+    );
+  }
+
+  followToken() {
+    if (this._followFrame) return;
+    this._followFrame = requestAnimationFrame(() => {
+      this._followFrame = null;
+      if (this.rendered) this.setPosition();
+    });
   }
   _insertElement(element) {
     document.body.appendChild(element);
@@ -206,6 +265,10 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
   }
 
   async close(options = {}) {
+    if (this._deferClose) {
+      this._closeOnReleaseUnlessPanned();
+      return this;
+    }
     if (this.element) this.element.classList.add("ax-th-closing");
     if (this._submenuTimeout) {
       clearTimeout(this._submenuTimeout);
@@ -215,6 +278,7 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
     this._cleanupInputs();
     this._clearCaches();
     this._els = null;
+    this._attachment = null;
     return await super.close(options);
   }
 
@@ -419,8 +483,8 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
     const token = this.object;
     const tokenDoc = token.document;
     const gridSize = canvas.grid.size;
-    const tokenX = tokenDoc.x;
-    const tokenY = tokenDoc.y;
+    const tokenX = token.x;
+    const tokenY = token.y;
     const tokenWidth = tokenDoc.width * gridSize;
     const tokenHeight = tokenDoc.height * gridSize;
     const topLeft = canvas.clientCoordinatesFromCanvas({
@@ -433,21 +497,42 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
     });
     const tokenScreenWidth = bottomRight.x - topLeft.x;
     const tokenScreenHeight = bottomRight.y - topLeft.y;
-    let left = topLeft.x + tokenScreenWidth + 15;
-    let top = topLeft.y + tokenScreenHeight / 2;
     const padding = 20;
-    const hudWidth = 240;
-    const hudHeight = 200;
-    if (left + hudWidth > window.innerWidth - padding)
-      left = topLeft.x - hudWidth - 15;
-    const finalLeft = Math.max(
-      padding,
-      Math.min(left, window.innerWidth - hudWidth - padding),
-    );
-    const finalTop = Math.max(
-      padding,
-      Math.min(top, window.innerHeight - hudHeight - padding),
-    );
+    const hudWidth = this.element.offsetWidth || 240;
+    const hudHeight = this.element.offsetHeight || 200;
+    const rightOfToken = topLeft.x + tokenScreenWidth + 15;
+    const leftOfToken = topLeft.x - hudWidth - 15;
+    const anchorY = topLeft.y + tokenScreenHeight / 2;
+    let finalLeft;
+    let finalTop;
+    if (this._attachment) {
+      const { flipLeft, flipUp, dx, dy } = this._attachment;
+      finalLeft = (flipLeft ? leftOfToken : rightOfToken) + dx;
+      finalTop = (flipUp ? anchorY - hudHeight : anchorY) + dy;
+    } else {
+      const flipLeft = rightOfToken + hudWidth > window.innerWidth - padding;
+      const flipUp = anchorY + hudHeight > window.innerHeight - padding;
+      const left = flipLeft ? leftOfToken : rightOfToken;
+      const top = flipUp ? anchorY - hudHeight : anchorY;
+      finalLeft = Math.max(
+        padding,
+        Math.min(left, window.innerWidth - hudWidth - padding),
+      );
+      finalTop = Math.max(
+        padding,
+        Math.min(top, window.innerHeight - hudHeight - padding),
+      );
+      // Freeze the side and clamp offset chosen on open so the HUD then moves
+      // rigidly with the token, sliding off screen instead of re-clamping.
+      if (this.element.offsetHeight) {
+        this._attachment = {
+          flipLeft,
+          flipUp,
+          dx: finalLeft - left,
+          dy: finalTop - top,
+        };
+      }
+    }
     this.element.style.position = "fixed";
     this.element.style.left = `${finalLeft}px`;
     this.element.style.top = `${finalTop}px`;
@@ -783,9 +868,10 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
   }
 
   _showSubmenu(trigger, submenu, skipReset = false) {
-    this._positionSubmenu(trigger, submenu);
     trigger.classList.add("ax-th-expanded");
+    // Must be visible before measuring; a display:none submenu reports zero size.
     submenu.classList.add("ax-th-active");
+    this._positionSubmenu(trigger, submenu);
     if (submenu.classList.contains("ax-th-status-effects")) {
       const search = submenu.querySelector("[data-effect-search='true']");
       if (search) {
@@ -830,13 +916,22 @@ class AxTokenHud extends foundry.applications.api.HandlebarsApplicationMixin(
   }
 
   _positionSubmenu(trigger, submenu) {
-    const triggerRect = trigger.getBoundingClientRect();
-    const submenuRect = submenu.getBoundingClientRect();
+    if (!trigger) return;
+    const padding = 20;
     submenu.classList.remove("ax-th-flip-horizontal", "ax-th-flip-vertical");
-    if (triggerRect.right + submenuRect.width > window.innerWidth - 20)
+    submenu.style.maxHeight = "";
+    const triggerRect = trigger.getBoundingClientRect();
+    const { width, height } = submenu.getBoundingClientRect();
+    if (triggerRect.right + width > window.innerWidth - padding)
       submenu.classList.add("ax-th-flip-horizontal");
-    if (triggerRect.top + submenuRect.height > window.innerHeight - 20)
+    const spaceBelow = window.innerHeight - padding - triggerRect.top;
+    const spaceAbove = triggerRect.bottom - padding;
+    if (height <= spaceBelow) return;
+    if (height <= spaceAbove || spaceAbove > spaceBelow)
       submenu.classList.add("ax-th-flip-vertical");
+    const available = Math.max(spaceAbove, spaceBelow);
+    if (height > available)
+      submenu.style.maxHeight = `${Math.max(available, 100)}px`;
   }
 
   async _onTogglePalette(event, target) {
